@@ -1,0 +1,10 @@
+# root/vnext-ledger/requirements.txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-dotenv==1.0.0
+python-multipart==0.0.9
+
+python -m pip install httpx
+python -m pip install python-multipart
+pip install PyJWT
+
