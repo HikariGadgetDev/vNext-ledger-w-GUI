@@ -17,7 +17,8 @@ def render_notes_table(notes: list[dict]) -> str:
     rows = []
     for n in notes:
         status = esc(n["status"])
-        priority = n["priority"]
+        priority = n.get("priority")
+        priority_txt = "-" if priority is None else esc(str(priority))
         # Contract (P1.5): slug may be Unicode; HTML uses esc() for display and quote(..., safe="") for href.
         # Ref: tests/test_slug_unicode_ui.py::test_notes_table_html_renders_unicode_slug_and_encoded_href
         slug_txt = esc(n["slug"])
@@ -36,7 +37,7 @@ def render_notes_table(notes: list[dict]) -> str:
             f"""
             <tr>
                 <td><span class="{status_class}">{status}</span></td>
-                <td>{priority}</td>
+                <td>{priority_txt}</td>
                 <td><a href="/notes/{slug_url}">{slug_txt}</a></td>
                 <td>{evidence_count}</td>
             </tr>
@@ -73,7 +74,8 @@ def render_notes_table(notes: list[dict]) -> str:
 def render_note_detail(note: dict, evidence: list[dict], events: list[dict]) -> str:
     slug = esc(note["slug"])
     status = esc(note["status"])
-    priority = note["priority"]
+    p = note.get("priority")
+    priority = "-" if p is None else esc(str(p))
     created = esc(note["created_at"])
     updated = esc(note["updated_at"])
 

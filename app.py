@@ -262,7 +262,11 @@ ALLOWED_STATUS_ORDER: list[str] = ["open", "doing", "parked", "done", "stale"]
 ALLOWED_STATUS = set(ALLOWED_STATUS_ORDER)
 
 
-PRIORITY_RANGE = (1, 5)
+PRIORITY_RANGE = (1, 3)
+
+
+# Risk level: 2段階（high, critical）
+ALLOWED_RISK_LEVEL = {"high", "critical"}
 
 
 # ============================================================
@@ -406,9 +410,24 @@ def _should_autologin_localhost(request: Request, s: Settings) -> bool:
 
 
 def _wants_html(request: Request) -> bool:
+    """
+    Content negotiation policy:
+    - If client explicitly asks HTML => HTML
+    - If client explicitly asks JSON  => JSON
+    - If Accept is neutral (*/* or missing):
+        - JSON body (Content-Type: application/json) => JSON (for API/test clients)
+        - otherwise => HTML (for browser/htmx)
+    """
     accept = (request.headers.get("accept") or "").lower()
-    # Treat */* as neutral (curl default). Only consider explicit HTML accepts as HTML.
-    return ("text/html" in accept) or ("application/xhtml+xml" in accept)
+    ct = (request.headers.get("content-type") or "").lower()
+
+    if ("text/html" in accept) or ("application/xhtml+xml" in accept):
+        return True
+    if "application/json" in accept:
+        return False
+    if (not accept) or ("*/*" in accept):
+        return "application/json" not in ct
+    return False
 
 
 def _wants_json(request: Request) -> bool:
@@ -613,7 +632,8 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'open',
-                priority INTEGER DEFAULT 3,
+                priority INTEGER,
+                risk_level TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -897,7 +917,7 @@ def upsert_note(con: sqlite3.Connection, slug: str, now: str) -> Tuple[int, bool
         con.execute(
             """
             INSERT INTO notes (slug, status, priority, created_at, updated_at)
-            VALUES (?, 'open', 3, ?, ?)
+            VALUES (?, 'open', NULL, ?, ?)
             """,
             (slug, now, now),
         )
@@ -1444,46 +1464,106 @@ def root(request: Request):
 # ============================================================
 
 @app.get("/notes/table")
-def notes_table(request: Request, status: Optional[str] = None):
+def notes_table(
+    request: Request,
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    comment: Optional[str] = None,
+):
     # JSON convenience exception.
     if not (_no_auth_json_exception() and _is_local_host(request) and _wants_json(request)):
         _ensure_role(request, {"admin", "dev"})
 
-    with db() as con:
-        if status:
-            if status not in ALLOWED_STATUS:
-                raise HTTPException(status_code=400, detail="Invalid status")
-            rows = con.execute(
-                """
-                SELECT n.id, n.slug, n.status, n.priority, n.created_at, n.updated_at,
-                       COUNT(e.id) as evidence_count
-                FROM notes n
-                LEFT JOIN evidence e ON n.id = e.note_id
-                WHERE n.status = ?
-                GROUP BY n.id
-                ORDER BY n.priority DESC, n.updated_at DESC
-                """,
-                (status,),
-            ).fetchall()
+    where: list[str] = []
+    params: list[object] = []
+
+    if status:
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if not statuses:
+            raise HTTPException(status_code=400, detail="Invalid status filter")
+        for s in statuses:
+            if s not in ALLOWED_STATUS:
+                raise HTTPException(status_code=400, detail="Invalid status filter")
+        where.append("n.status IN (%s)" % ",".join(["?"] * len(statuses)))
+        params.extend(statuses)
+
+    # priority filter:
+    #   ?priority=none|1|2|3|none,1,2
+    # none -> priority IS NULL
+    if priority is not None and priority.strip() != "":
+        parts = [p.strip() for p in priority.split(",") if p.strip()]
+        has_none = any(p.lower() == "none" for p in parts)
+        nums: list[int] = []
+        for p in parts:
+            if p.lower() == "none":
+                continue
+            if not p.isdigit():
+                raise HTTPException(status_code=400, detail="Invalid priority filter")
+            v = int(p)
+            if v < PRIORITY_RANGE[0] or v > PRIORITY_RANGE[1]:
+                raise HTTPException(status_code=400, detail="Invalid priority filter")
+            nums.append(v)
+        nums = sorted(set(nums))
+
+        if has_none and nums:
+            where.append("(n.priority IS NULL OR n.priority IN (%s))" % ",".join(["?"] * len(nums)))
+            params.extend(nums)
+        elif has_none:
+            where.append("n.priority IS NULL")
+        elif nums:
+            where.append("n.priority IN (%s)" % ",".join(["?"] * len(nums)))
+            params.extend(nums)
         else:
-            rows = con.execute(
-                """
-                SELECT n.id, n.slug, n.status, n.priority, n.created_at, n.updated_at,
-                       COUNT(e.id) as evidence_count
-                FROM notes n
-                LEFT JOIN evidence e ON n.id = e.note_id
-                GROUP BY n.id
-                ORDER BY n.priority DESC, n.updated_at DESC
-                """
-            ).fetchall()
+            # priority= (only commas/spaces) is treated as no filter; but priority=none must be explicit.
+            raise HTTPException(status_code=400, detail="Invalid priority filter")
+
+    # comment filter:
+    #   ?comment=any|none
+    # 判定は note_events.event_type='comment' の存在（JOINせず EXISTS）
+    if comment is not None and comment.strip() != "":
+        v = comment.strip().lower()
+        if v == "any":
+            where.append(
+                "EXISTS (SELECT 1 FROM note_events ne WHERE ne.note_id = n.id AND ne.event_type = 'comment')"
+            )
+        elif v == "none":
+            where.append(
+                "NOT EXISTS (SELECT 1 FROM note_events ne WHERE ne.note_id = n.id AND ne.event_type = 'comment')"
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid comment filter")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    with db() as con:
+        rows = con.execute(
+            f"""
+            SELECT n.id, n.slug, n.status, n.priority, n.created_at, n.updated_at,
+                   COUNT(e.id) AS evidence_count
+            FROM notes n
+            LEFT JOIN evidence e ON n.id = e.note_id
+            {where_sql}
+            GROUP BY n.id
+            ORDER BY 
+                CASE WHEN n.priority IS NULL THEN 0 ELSE 1 END,
+                n.priority ASC,
+                n.updated_at DESC
+            """,
+            tuple(params),
+        ).fetchall()
 
     notes = [dict(r) for r in rows]
-    # JSONは明示されたときだけ返す。その他はHTML。
-    if _wants_json(request) and not _wants_html(request):
-        return {"notes": notes}
 
-    resp = HTMLResponse(render_notes_table(notes))
-    _ensure_csrf_cookie(resp, request)
+    if _wants_html(request):
+        resp = HTMLResponse(render_notes_table(notes))
+        _ensure_csrf_cookie(resp, request)
+        # 刺し⑥: Vary: Accept を付与（HTML/JSON分岐によるキャッシュ事故防止）
+        resp.headers["Vary"] = "Accept"
+        return resp
+
+    from fastapi.responses import JSONResponse
+    resp = JSONResponse({"notes": notes})
+    resp.headers["Vary"] = "Accept"
     return resp
 
 
@@ -1550,14 +1630,31 @@ def update_note(request: Request, slug: str, req: NoteUpdateRequest):
     if not (_no_auth_json_exception() and _is_local_host(request) and _wants_json(request)):
         _ensure_role(request, {"admin", "dev"})
 
-    # Task 3-A: 空JSONは即204
-    if req.status is None and req.priority is None and req.comment is None:
+    # 空PATCH（{}）は即204（P1 contract）
+    # Pydantic v2: model_fields_set で "送られたキー" を判定できる
+    fields_set = getattr(req, "model_fields_set", set())
+    if not fields_set:
         return Response(status_code=204)
+
+    # null指定の扱い:
+    # - priority は {"priority": null} を "クリア" として扱う
+    # - status/comment は null を無効（400）として扱う（意図不明確のため）
+    status_provided = "status" in fields_set
+    priority_provided = "priority" in fields_set
+    comment_provided = "comment" in fields_set
+
+    if status_provided and req.status is None:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    if comment_provided and req.comment is None:
+        raise HTTPException(status_code=400, detail="Invalid comment")
 
     now = datetime.now().isoformat(timespec="seconds")
 
     with db() as con:
-        note_row = con.execute("SELECT id, status, priority FROM notes WHERE slug = ?", (slug,)).fetchone()
+        note_row = con.execute(
+            "SELECT id, status, priority FROM notes WHERE slug = ?",
+            (slug,),
+        ).fetchone()
         if not note_row:
             raise HTTPException(status_code=404, detail="Note not found")
 
@@ -1565,63 +1662,71 @@ def update_note(request: Request, slug: str, req: NoteUpdateRequest):
         old_status = note_row["status"]
         old_priority = note_row["priority"]
 
-        new_status = req.status if req.status is not None else old_status
-        new_priority = req.priority if req.priority is not None else old_priority
+        new_status = old_status
+        new_priority = old_priority
 
-        if req.status is not None:
-            if new_status not in ALLOWED_STATUS:
+        if status_provided:
+            if req.status not in ALLOWED_STATUS:
                 raise HTTPException(status_code=400, detail="Invalid status")
+            new_status = req.status
 
-        if req.priority is not None:
-            if new_priority < PRIORITY_RANGE[0] or new_priority > PRIORITY_RANGE[1]:
-                raise HTTPException(status_code=400, detail="Invalid priority (must be 1-5)")
+        if priority_provided:
+            # priority は None 許可（クリア）
+            if req.priority is not None:
+                if req.priority < PRIORITY_RANGE[0] or req.priority > PRIORITY_RANGE[1]:
+                    raise HTTPException(status_code=400, detail=f"Invalid priority (must be {PRIORITY_RANGE[0]}-{PRIORITY_RANGE[1]})")
+            new_priority = req.priority
 
+        # 変更検出
         changed = False
-
         if new_status != old_status or new_priority != old_priority:
             changed = True
-
-        if req.comment is not None:
+        if comment_provided and req.comment is not None:
             changed = True
 
-        if changed:
-            con.execute(
-                "UPDATE notes SET status = ?, priority = ?, updated_at = ? WHERE id = ?",
-                (new_status, new_priority, now, note_id),
-            )
-
-            if new_status != old_status:
-                con.execute(
-                    """
-                    INSERT INTO note_events (note_id, event_type, old_value, new_value, changed_at)
-                    VALUES (?, 'status_change', ?, ?, ?)
-                    """,
-                    (note_id, old_status, new_status, now),
-                )
-
-            if new_priority != old_priority:
-                con.execute(
-                    """
-                    INSERT INTO note_events (note_id, event_type, old_value, new_value, changed_at)
-                    VALUES (?, 'priority_change', ?, ?, ?)
-                    """,
-                    (note_id, str(old_priority), str(new_priority), now),
-                )
-
-            if req.comment is not None:
-                con.execute(
-                    """
-                    INSERT INTO note_events (note_id, event_type, old_value, new_value, changed_at)
-                    VALUES (?, 'comment', NULL, ?, ?)
-                    """,
-                    (note_id, req.comment, now),
-                )
-
-            con.commit()
-
-        # Task 2: 同値PATCHは204（台帳汚染防止）
+        # no-op → 204（監査ログ汚染防止）
         if not changed:
             return Response(status_code=204)
+
+        # 変更あり → UPDATE + events
+        con.execute(
+            "UPDATE notes SET status = ?, priority = ?, updated_at = ? WHERE id = ?",
+            (new_status, new_priority, now, note_id),
+        )
+
+        if new_status != old_status:
+            con.execute(
+                """
+                INSERT INTO note_events (note_id, event_type, old_value, new_value, changed_at)
+                VALUES (?, 'status_change', ?, ?, ?)
+                """,
+                (note_id, old_status, new_status, now),
+            )
+
+        if new_priority != old_priority:
+            con.execute(
+                """
+                INSERT INTO note_events (note_id, event_type, old_value, new_value, changed_at)
+                VALUES (?, 'priority_change', ?, ?, ?)
+                """,
+                (
+                    note_id,
+                    None if old_priority is None else str(old_priority),
+                    None if new_priority is None else str(new_priority),
+                    now,
+                ),
+            )
+
+        if comment_provided and req.comment is not None:
+            con.execute(
+                """
+                INSERT INTO note_events (note_id, event_type, old_value, new_value, changed_at)
+                VALUES (?, 'comment', NULL, ?, ?)
+                """,
+                (note_id, req.comment, now),
+            )
+
+        con.commit()
 
         updated_row = con.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
 
